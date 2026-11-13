@@ -1,0 +1,12 @@
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm'),path=require('node:path');
+const app=fs.readFileSync(path.join(__dirname,'../dist/app.js'),'utf8');
+const nodes=new Map();const $=id=>{if(!nodes.has(id))nodes.set(id,{children:[],innerHTML:'',textContent:'',querySelector:()=>({textContent:''})});return nodes.get(id)};
+$('calendar').children=Array.from({length:6},()=>({querySelector:()=>({textContent:''})}));
+const row={};const h={driver:12,started:1,status:'running',laps:.5,elapsed:24,reason:'行驶中',modelHash:'abcdef123456789',weightsUnchanged:true,lapSeconds:[null,null,null]};
+const state={phase:'holdout',winner:{drivers:[12]},holdout:h,active:1,track:5,cars:Array.from({length:22},()=>({reason:'行驶中'}))};
+const box={$,state,config:{drivers:Array.from({length:22},()=>({code:'BEA'}))},rows:new Map([[0,row],[12,{}]]),selected:12,preview:null,online:true,clock:s=>String(s)};
+vm.createContext(box);vm.runInContext(app.slice(app.indexOf('function updateHoldout()'),app.indexOf("$('holdout-start').onclick")),box);
+box.updateHoldout();assert.equal(row.disabled,true);assert.equal($('holdout-panel').hidden,false);assert.match($('phase').textContent,/泛化测试/);assert.match($('holdout-proof').textContent,/校验一致/);
+h.status='failed';h.reason='驶出有效路面';box.updateHoldout();assert.match($('holdout-result').textContent,/未通过/);assert.match($('holdout-result').textContent,/驶出有效路面/);
+state.phase='finished';state.lastHoldout=h;delete state.holdout;box.updateHoldout();assert.equal(row.disabled,false);assert.equal($('holdout-close').hidden,true);assert.match($('holdout-result').textContent,/未通过/);
+console.log('PASS: isolated holdout controls, frozen-model proof, failure result and return');

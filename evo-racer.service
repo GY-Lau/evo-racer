@@ -1,0 +1,16 @@
+[Unit]
+Description=EVO Racer CUDA training server
+
+[Service]
+Type=simple
+WorkingDirectory=%h/evo-racer
+Environment=BIND=0.0.0.0
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash %h/evo-racer/run.sh
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

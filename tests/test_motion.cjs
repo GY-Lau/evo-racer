@@ -1,0 +1,22 @@
+const assert=require('node:assert/strict');
+const fs=require('node:fs'),vm=require('node:vm'),path=require('node:path');
+const box={};vm.createContext(box);
+vm.runInContext(fs.readFileSync(path.join(__dirname,'../dist/motion.js'),'utf8'),box);
+const state=(step,x,extra={})=>({generation:1,phase:'training',track:0,totalSteps:step,paused:false,cars:[{id:0,candidate:1,x,y:0,angle:0}],...extra});
+const motion=box.RaceMotion.create();
+for(let i=0;i<5;i++)motion.push(state(i,i*24),i*240);
+assert.equal(JSON.stringify([600,620,640,660].map(t=>motion.sample(t)[0].x)),'[30,32,34,36]');
+motion.push(state(4,96),1000);assert.equal(motion.sample(680)[0].x,38);
+motion.push(state(5,110,{paused:true}),1100);assert.equal(motion.sample(1100)[0].x,110);
+motion.push(state(6,500,{track:1}),1200);assert.equal(motion.sample(1200)[0].x,500);
+const change=box.RaceMotion.create({delay:0});change.push(state(1,0),0);
+const next=state(2,100);next.cars[0].candidate=2;change.push(next,100);assert.equal(change.sample(50)[0].x,100);
+const reset=box.RaceMotion.create();reset.push(state(100,80),0);reset.push(state(0,0),100);assert.equal(reset.sample(100)[0].x,0);
+console.log('PASS: continuous interpolation, duplicate packets, pause, scene and model boundaries');
+
+const holdout=box.RaceMotion.create({delay:0});
+const hs=(n,x,started=1)=>state(n,x,{phase:'holdout',track:5,winner:{drivers:[0]},holdout:{started}});
+holdout.push(hs(1,0),0);holdout.push(hs(2,100),100);
+assert.equal(holdout.sample(50)[0].x,50);
+holdout.push(hs(2,0,2),110);assert.equal(holdout.sample(110)[0].x,0);
+console.log('PASS: champion holdout interpolation and repeated-trial boundaries');

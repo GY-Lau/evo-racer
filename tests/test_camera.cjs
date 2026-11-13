@@ -1,0 +1,15 @@
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm'),path=require('node:path');
+const box={};vm.createContext(box);vm.runInContext(fs.readFileSync(path.join(__dirname,'../dist/camera.js'),'utf8'),box);
+const cam=box.RaceCamera.create();let v=cam.view(1000,600,{x:500,y:300},0);
+assert.equal(v.zoom,8);assert.equal(v.x+500*v.scale,500);
+const x=740,y=120,world={x:v.center.x+(x-500)/v.scale,y:v.center.y+(y-300)/v.scale};
+cam.wheel(v,x,y,-120);v=cam.view(1000,600,null,0);
+assert.equal(cam.mode,'free');assert.ok(v.zoom>8);
+assert.ok(Math.abs(world.x*v.scale+v.x-x)<1e-8);assert.ok(Math.abs(world.y*v.scale+v.y-y)<1e-8);
+const old=v;cam.pan(v,40,-20);v=cam.view(1000,600,null,0);assert.ok(Math.abs(v.x-old.x-40)<1e-8);assert.ok(Math.abs(v.y-old.y+20)<1e-8);
+for(let i=0;i<50;i++){cam.wheel(v,500,300,-300);v=cam.view(1000,600,null,0)}assert.equal(v.zoom,32);
+for(let i=0;i<50;i++){cam.wheel(v,500,300,300);v=cam.view(1000,600,null,0)}assert.equal(v.zoom,1);assert.equal(v.center.x,700);
+cam.follow();assert.equal(cam.view(1000,600,{x:100,y:200},0).zoom,8);
+assert.equal(cam.view(1000,600,null,1,true).zoom,1);
+cam.pan(cam.view(1000,600,{x:100,y:200},1),20,20);assert.equal(cam.view(1000,600,null,2).zoom,1);
+console.log('PASS: cursor anchor, drag translation, 1–32x limits, follow and circuit previews');

@@ -1,0 +1,29 @@
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.whl
+requirements-installed.txt
+
+# Training state and historical results stay on the Jetson
+checkpoints/
+records/
+
+# Local backups and deployment checks
+.backup-*/
+.before-*/
+.optimization-baseline/
+.*-check/
+*.tmp
+*.log
+
+# Local credentials and editor files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.vscode/
+.idea/
+.DS_Store
