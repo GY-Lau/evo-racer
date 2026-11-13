@@ -175,63 +175,219 @@ class Arena:
         return velocity,yaw,steer,acceleration,lateral,usage,throttle,brake
 
     def _compute(self):
+        """推进当前计算批次的一个模拟时间步，依次完成以下工作：
+
+        射线感知 → 神经网络推理 → 动力学 → 位置积分 → 进度计算 → 碰撞 → 写回。
+        本函数只使用当前权重计算动作，不在这里选择、交叉或变异网络。
+
+        读形状时，N 表示当前计算批次的车辆数，最后一维的 2 通常表示 x/y。
+        None 用于插入长度为 1 的维度，让 PyTorch 自动广播，省去逐辆循环。
+        例如 [N, 1, 2] + [N, 33, 2] 会得到 [N, 33, 2]。
+        sum(-1) 沿最后一维求和；dim=1 表示沿第二个维度操作。
+
+        数据留在设备张量中，计算可以被 CUDA Graph 捕获并重复执行。
+        前导下划线表示内部辅助方法，通常通过 step() 调用。
+        """
+        # ① 取出本次要计算的模型。ids 是它们在完整种群中的行号，形状 [N]。
+        # 批次定期压缩，因此可能还含刚淘汰、尚未移除的车辆，后面用 moving 屏蔽。
+        # 一张 CUDA Graph 重放期间，索引和张量地址保持固定；缩减批次后重新捕获。
         ids = self.active_indices
-        # Indices and tensor addresses stay fixed for one captured graph.
+
+        # getattr(self, name) 类似按成员名获取对象字段；index_select(0, ids) 挑选行。
+        # batch 是当前批次旧状态的副本，最后只把仍在行驶车辆的新状态写回。
         batch = {name: getattr(self,name).index_select(0,ids) for name in self.STATE_NAMES}
+
+        # xy：[N, 2]，地图坐标；angle：[N]，车身航向角 rad；speed：[N]，车速 m/s。
         xy,angle,speed = batch['xy'],batch['angle'],batch['speed']
+
+        # reason == 0 表示仍在行驶。moving 是 [N] 布尔掩码，不表示车速是否大于零。
         moving = batch['reason']==0
+
+        # ② 将 7 条车体相对射线方向，加上车身航向角，转换成地图中的绝对方向。
+        # [N, 1] + [1, 7] → [N, 7]；每辆车都有前方及左右不同方向的测距射线。
         a = angle[:,None]+self.ray_angles[None]
+
+        # 单位方向向量 d = [cos(a), sin(a)]，stack 后形状为 [N, 7, 2]。
         direction = torch.stack((a.cos(),a.sin()),dim=-1)
+
+        # 沿每条射线生成 0、2、4……180 米的 91 个探测点：p_probe = xy + d × distance。
+        # scale 的单位是“地图坐标单位/米”，将米制距离换成与 xy 相同的坐标单位。
+        # [N, 1, 1, 2] + [N, 7, 1, 2] × [1, 1, 91, 1] → [N, 7, 91, 2]。
         probes = xy[:,None,None]+direction[:,:,None]*(self.distances*self.scale)[None,None,:,None]
+
+        # inside() 检查探测点是否在道路栅格内，得到 [N, 7, 91] 布尔数组。
+        # 路内点填 180，路外点填自身距离，再沿 91 个点取最小值：
+        # 得到每条射线第一次探到路外的采样距离，rays 形状 [N, 7]，单位米。
+        # 没探到路外时取 180 米；这是离散采样近似，不是精确的边界交点求解。
         rays = torch.where(self.inside(probes),180.,self.distances).amin(dim=-1)
+
+        # ③ 构造网络输入：[7 条归一化测距, 1 个归一化车速]，形状 [N, 8]。
+        # 射线除以 180 米，车速除以 95 m/s；cat(dim=1) 按列拼接。
         inputs = torch.cat((rays/180,speed[:,None]/95),dim=1)
+
+        # 每个模型有自己的 112 个参数；这里只取本批次的权重，形状 [N, 112]。
         weights = self.weights.index_select(0,ids)
+
+        # 网络结构 8 → 10 → 2：第一层 10×(8 个权重+1 个偏置)=90 个参数；
+        # 第二层 2×(10 个权重+1 个偏置)=22 个参数，合计 112。
+        # reshape 中 -1 让 PyTorch 自动推导车辆数 N。
         first,second = weights[:,:90].reshape(-1,10,9),weights[:,90:].reshape(-1,2,11)
+
+        # 隐藏层：h_j = tanh(Σ_i W1[j,i] × input_i + b1[j])，输出 [N, 10]。
+        # [N, 10, 8] × [N, 1, 8] 广播相乘，sum(-1) 对 8 个输入求和。
+        # first[:, :, 8] 是每个隐藏神经元的偏置。
         hidden = torch.tanh((first[:,:,:8]*inputs[:,None,:]).sum(-1)+first[:,:,8])
+
+        # 输出层：u_k = tanh(Σ_j W2[k,j] × h_j + b2[k])，输出 [N, 2]。
+        # tanh 将指令限制在 [-1, 1]；两列分别控制目标前轮转角和目标速度。
+        # 固定长度的逐元素乘加也让不同批次尺寸采用一致的网络计算方式。
         outputs = torch.tanh((second[:,:,:10]*hidden[:,None,:]).sum(-1)+second[:,:,10])
+
+        # ④ 调用 dynamics()：根据旧车速、旧航向角速度、旧前轮转角和新指令，
+        # 计算受加减速、转向响应和抓地力约束的新运动状态。
         dynamic = self.dynamics(speed,batch['yaw_rate'],batch['steer'],outputs)
+
+        # ax/ay 是纵向/横向加速度 m/s²，usage 是抓地预算使用率；
+        # throttle/brake 是从加速度指令派生的油门/制动开度，范围 [0, 1]。
         speed,yaw_rate,steer,ax,ay,usage,throttle,brake = dynamic
+
+        # torch.where(condition, a, b) 逐元素选择；已结束车辆保留旧车速。
         speed = torch.where(moving,speed,batch['speed'])
+
+        # ⑤ 用新航向角速度积分车身航向：ψ_next = ψ + r_next × Δt。
+        # moving 参与乘法时，True 当作 1、False 当作 0，已结束车辆不转动。
         angle = angle+yaw_rate*DT*moving
+
+        # 用更新后的车速和航向积分位置：
+        # x_next = x + v_next × cos(ψ_next) × Δt × scale；y 同理使用 sin。
+        # stack 后是 [N, 2]，步行距离扩展为 [N, 1]，同时更新每辆车的 x/y。
         xy = xy+torch.stack((angle.cos(),angle.sin()),dim=-1)*(speed*self.scale*DT*moving)[:,None]
+
+        # ⑥ 在上一赛道索引附近搜索 -16……+16 共 33 条中心线线段。
+        # 赛道是闭环，用 % POINTS 将索引环绕到 [0, 511]，得到 [N, 33]。
+        # 局部搜索用于保持进度连续，避免直接跳到旁边靠得很近的另一段赛道。
         candidates = (batch['index'][:,None]+self.offsets[None])%POINTS
+
+        # starts：[N, 33, 2]，候选线段的起点 A。
         starts = self.points[candidates]
+
+        # 线段向量 s = B - A；最后一个采样点与第一个点相连。
         segments = self.points[(candidates+1)%POINTS]-starts
+
+        # 从各候选起点指向车辆中心的向量 q = P - A，形状 [N, 33, 2]。
         relative = xy[:,None]-starts
+
+        # 点在线段上的投影比例 t = clamp((q·s)/(s·s), 0, 1)，形状 [N, 33]。
+        # 0 对应起点 A，1 对应终点 B；分母最小取 1e-8，避免退化线段除以零。
         projection = ((relative*segments).sum(-1)/segments.square().sum(-1).clamp_min(1e-8)).clamp(0,1)
+
+        # 到最近投影点的距离平方 d² = |q - t×s|²，形状 [N, 33]。
+        # 此处只比较距离大小，不必开平方。
         distances = (relative-projection[...,None]*segments).square().sum(-1)
+
+        # argmin 返回每辆车最近线段在 33 个候选中的列号，形状 [N]。
         nearest = distances.argmin(dim=1)
+
+        # gather 按每辆车自己的列号取出投影比例；squeeze(1) 去掉长度为 1 的维度。
+        # along 表示车辆位于最近线段的前半段还是后半段，形状 [N]。
         along = projection.gather(1,nearest[:,None]).squeeze(1)
+
+        # 取该线段的实际赛道索引，投影比例 > 0.5 时选下一个采样点。
+        # 得到车辆对应的离散中心线点索引 [N]，它不是米制行驶距离。
         index = (candidates.gather(1,nearest[:,None]).squeeze(1)+(along>.5).long())%POINTS
+
+        # ⑦ 计算带闭环修正的有符号索引增量，映射到 [-256, 255]。
+        # 例如旧索引 511、新索引 0，增量应为 +1，而不是 -511。
         delta = (index-batch['index']+POINTS//2)%POINTS-POINTS//2
+
+        # 累加有符号进度；允许前进和倒退，已结束车辆保持不变。
+        # 每累计 POINTS=512 个采样点约对应一圈，进度不是精确的米数。
         progress = batch['progress']+delta*moving
+
+        # 更新当前赛道索引，已结束车辆保留旧索引。
         index = torch.where(moving,index,batch['index'])
+
+        # 刷新最远进度时将停滞计时清零，否则增加 Δt。
+        # 因此“停滞”包括来回移动但一直没有超过历史最远进度的情况。
         idle = torch.where(progress>batch['best'],0.,batch['idle']+DT)
+
+        # 保存本次尝试到目前为止的最远进度，供训练评分和圈数展示使用。
         best = torch.maximum(batch['best'],progress)
+
+        # ⑧ 构造车身局部坐标系：前向 e_f=[cosψ,sinψ]，侧向 e_s=[-sinψ,cosψ]。
+        # 两个方向向量相互垂直，形状均为 [N, 2]。
         forward = torch.stack((angle.cos(),angle.sin()),dim=-1)
         side = torch.stack((-angle.sin(),angle.cos()),dim=-1)
+
+        # 将车身四角从米制局部坐标转换到地图坐标：
+        # P_corner = xy + (e_f × local_x + e_s × local_y) × scale。
+        # body_corners 是 [4, 2]，角点结果为 [N, 4, 2]。
         corners = xy[:,None]+(forward[:,None]*self.body_corners[None,:,0,None]+side[:,None]*self.body_corners[None,:,1,None])*self.scale
+
+        # 每个角点分别相对 33 条候选线段求距离，向量数组为 [N, 4, 33, 2]。
         corner_relative = corners[:,:,None]-starts[:,None]
+
+        # 对四个角点重复点到线段的投影公式，得到比例 [N, 4, 33]。
         corner_projection = ((corner_relative*segments[:,None]).sum(-1)/segments.square().sum(-1)[:,None].clamp_min(1e-8)).clamp(0,1)
+
+        # 先算到各线段的距离平方，再沿 33 条线段取最小值，得到 [N, 4]。
         corner_distance = (corner_relative-corner_projection[...,None]*segments[:,None]).square().sum(-1).amin(-1)
+
+        # 每个角点到局部中心线的距离都必须 ≤ 半路宽，all(dim=1) 检查全部四角。
+        # 比较双方都用地图坐标距离的平方；on_road 是 [N] 布尔数组。
+        # 这是等宽道路的四角检查近似，不是整块车身多边形与实测路缘的精确碰撞。
         on_road = (corner_distance <= (WIDTH_METERS[self.track]*self.scale/2)**2).all(dim=1)
+
+        # ⑨ 按优先级确定失败原因：1=驶出路面，2=连续 6 秒未刷新最远进度，
+        # 3=累计进度低于起点 -12 个采样点，0=继续行驶。这里的 -12 不是 12 米。
+        # ~ 是张量布尔取反，嵌套 where 相当于逐辆执行 if / else if。
         reason = torch.where(~on_road,1,torch.where(idle>6,2,torch.where(progress < -12,3,0)))
+
+        # 必须达到目标圈数且本步没有失败，才算完成；同一步出界不能判为完赛。
         completed = (progress >= POINTS*self.laps)&(reason==0)
+
+        # 完成时使用状态码 4；转成 int8，用较小的整数类型保存状态。
         reason = torch.where(completed,4,reason).to(torch.int8)
+
+        # 已结束车辆保留原状态码，避免它们被重新判为行驶中或改写失败原因。
         reason = torch.where(moving,reason,batch['reason'])
+
+        # ⑩ GPU 上的步计数原地加一。add_ 的下划线后缀表示修改原张量。
+        # 使用设备张量计时，使 CUDA Graph 每次重放时也会真正递增计数。
+        # Python 侧的 self.ticks 在外层 step() 中另行更新。
         self.tick_tensor.add_(1)
+
+        # 只为本步完成的行驶车辆记录准确完成步数，其他车辆保留旧值。
+        # 完成模拟用时 = finish_tick × DT；尚未完成的初值为 -1。
         finish_tick = torch.where(moving&completed,self.tick_tensor,batch['finish_tick'])
+
+        # lap_ticks：[N, 目标圈数]，每列保存累计完成该圈时的模拟步数，初值 -1。
         lap_ticks = batch['lap_ticks']
         for lap in range(self.laps):
+            # 此前仍在行驶、本步四角在路内、达到该圈进度、而且尚未记录时才写入。
+            # & 表示逐元素逻辑“与”，不能在这里替换成 Python 标量的 and。
             crossed = moving&on_road&(progress>=POINTS*(lap+1))&(lap_ticks[:,lap]<0)
+
+            # 这里保存累计时间点；单圈耗时由相邻两列的步数差乘以 DT 得到。
             lap_ticks[:,lap] = torch.where(crossed,self.tick_tensor,lap_ticks[:,lap])
+
+        # ⑪ 收集新状态及用于前端显示的射线、网络活动、踏板和抓地力数据。
         values = dict(xy=xy,angle=angle,speed=speed,index=index,progress=progress,best=best,idle=idle,
             reason=reason,finish_tick=finish_tick,lap_ticks=lap_ticks,yaw_rate=yaw_rate,steer=steer,
             long_accel=ax,lateral_accel=ay,grip_usage=usage,throttle=throttle,brake=brake,
             rays=rays,inputs=inputs,hidden=hidden,outputs=outputs)
         for name,value in values.items():
+            # 获取完整种群中同名的目标张量；不能直接换成新对象，否则图重放的
+            # 固定内存地址会与后续读写的张量不一致。
             ref = getattr(self,name)
+
+            # 将 [N] 行驶掩码扩展成适合广播的形状：标量状态 [N]，
+            # xy 等二维状态 [N, 1]，以便一次选择该车辆所有列的新值或旧值。
             mask = moving.reshape((-1,)+(1,)*(value.ndim-1))
+
+            # moving 为 True 的车辆写新值，包括本步刚出局/完赛的最终状态；
+            # 此前已结束的车辆写回旧值，保持冻结。index_copy_ 按 ids 原地写回，
+            # 该批次以外的车辆行完全不动。
             ref.index_copy_(0,ids,torch.where(mask,value,batch[name]))
 
     def _capture(self, alive):
